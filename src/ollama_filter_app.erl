@@ -1,9 +1,8 @@
 -module(ollama_filter_app).
 -behaviour(application).
--behaviour(cowboy_handler).
 
 -export([start/2, stop/1]).
--export([init/2, terminate/3]).
+-export([handle/1]).
 
 start(_StartType, _StartArgs) ->
     {ok, Port} = em_filter:find_port(),
@@ -14,19 +13,25 @@ start(_StartType, _StartArgs) ->
 
 stop(_State) -> ok.
 
-init(Req0, State) ->
-    {ok, Body, Req} = cowboy_req:read_body(Req0),
-    {Value, Timeout} = extract_value_and_timeout(Body),
-    Embryos = generate_embryos(Value, Timeout),
-    Response = jsone:encode(#{embryo_list => Embryos}),
-    Req2 = cowboy_req:reply(200,
-        #{<<"content-type">> => <<"application/json">>},
-        Response,
-        Req
-    ),
-    {ok, Req2, State}.
+%% @doc Handle incoming requests from the filter server.
+%% This function is called by em_filter_server through Wade.
+%% @param Body The request body (JSON binary or string)
+%% @return JSON response as binary or string
+handle(Body) when is_binary(Body) ->
+    handle(binary_to_list(Body));
 
-terminate(_Reason, _Req, _State) -> ok.
+handle(Body) when is_list(Body) ->
+    io:format("Bing Filter received body: ~p~n", [Body]),
+    EmbryoList = generate_embryo_list(list_to_binary(Body)),
+    Response = #{embryo_list => EmbryoList},
+    jsone:encode(Response);
+
+handle(_) ->
+    jsone:encode(#{error => <<"Invalid request body">>}).
+
+generate_embryo_list(Body) ->
+    {Value, Timeout} = extract_value_and_timeout(Body),
+    generate_embryos(Value, Timeout).
 
 extract_value_and_timeout(JsonBinary) ->
     case jsone:decode(JsonBinary) of
