@@ -1,42 +1,77 @@
 %%%-------------------------------------------------------------------
-%%% @doc Ollama local LLM filter.
+%%% @doc Ollama local LLM agent.
 %%%
 %%% Sends the query to a local Ollama instance and returns the
 %%% generated response as a single embryo map.
+%%%
+%%% Maintains a conversation memory (list of {query, answer} pairs)
+%%% so the LLM can reference prior exchanges in its context window.
+%%%
+%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
+%%% Memory schema: `#{history => [{QueryBin, AnswerBin}]}' (newest last).
 %%% @end
 %%%-------------------------------------------------------------------
 -module(ollama_filter_app).
+%% @encoding utf8
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1]).
+-export([handle/2]).
+
+-define(CAPABILITIES, [
+    <<"ollama">>,
+    <<"llm">>,
+    <<"summarize">>,
+    <<"generate">>,
+    <<"local_ai">>
+]).
+
+-define(MAX_HISTORY, 5).
 
 %%====================================================================
 %% Application behaviour
 %%====================================================================
 
 start(_StartType, _StartArgs) ->
-    em_filter:start_filter(ollama_filter, ?MODULE).
+    em_filter:start_agent(ollama_filter, ?MODULE, #{
+        capabilities => ?CAPABILITIES,
+        memory       => ets
+    }).
 
 stop(_State) ->
-    em_filter:stop_filter(ollama_filter).
+    em_filter:stop_agent(ollama_filter).
 
 %%====================================================================
-%% Filter handler — returns a list of embryo maps
+%% Agent handler
 %%====================================================================
 
-handle(Body) when is_binary(Body) ->
-    generate_embryo_list(Body);
-handle(_) ->
-    [].
+handle(Body, Memory) when is_binary(Body) ->
+    {Value, Timeout} = extract_params(Body),
+    case Value of
+        "" -> {[], Memory};
+        _  ->
+            History = maps:get(history, Memory, []),
+            Config  = (ollama_handler:get_env_config())#{timeout => Timeout * 1000},
+            Prompt  = build_prompt_with_history(Value, History, Config),
+            case ollama_handler:generate(Prompt, Config) of
+                {ok, AnswerBin} when is_binary(AnswerBin) ->
+                    Embryo     = #{<<"properties">> => #{<<"resume">> => AnswerBin}},
+                    NewHistory = trim_history(
+                        History ++ [{list_to_binary(Value), AnswerBin}],
+                        ?MAX_HISTORY),
+                    {[Embryo], Memory#{history => NewHistory}};
+                {error, Reason} ->
+                    io:format("[ollama] generate failed: ~p~n", [Reason]),
+                    {[], Memory}
+            end
+    end;
+
+handle(_Body, Memory) ->
+    {[], Memory}.
 
 %%====================================================================
-%% Search and processing
+%% Internal helpers
 %%====================================================================
-
-generate_embryo_list(JsonBinary) ->
-    {Value, Timeout} = extract_params(JsonBinary),
-    generate_embryos(Value, Timeout).
 
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
@@ -47,25 +82,24 @@ extract_params(JsonBinary) ->
                 T when is_binary(T)  -> binary_to_integer(T)
             end,
             {binary_to_list(Val), Timeout};
-        _ -> {"", 10}
-    catch
-        _:_ -> {"", 10}
-    end.
-
-generate_embryos("", _) -> [];
-generate_embryos(Value, Timeout) ->
-    Config = (ollama_handler:get_env_config())#{timeout => Timeout * 1000},
-    Prompt = ollama_handler:format_prompt(
-        maps:get(prompt_template, Config, default_prompt()),
-        [Value]),
-    Result = ollama_handler:generate(Prompt, Config),
-    io:format("[OLLAMA] generate result: ~p~n", [Result]),
-    case Result of
-        {ok, ResumeBin} when is_binary(ResumeBin) ->
-            [#{<<"properties">> => #{<<"resume">> => ResumeBin}}];
         _ ->
-            []
+            {binary_to_list(JsonBinary), 10}
+    catch
+        _:_ -> {binary_to_list(JsonBinary), 10}
     end.
 
-default_prompt() ->
-    "Résume le texte suivant de façon concise :\n\n~s".
+build_prompt_with_history(Value, [], _Config) ->
+    unicode:characters_to_binary(
+        io_lib:format("Résume le texte suivant de façon concise :\n\n~s", [Value]));
+build_prompt_with_history(Value, History, _Config) ->
+    ContextLines = [["Q: ", Q, "\nA: ", A, "\n"] || {Q, A} <- History],
+    unicode:characters_to_binary(
+        io_lib:format("Contexte des échanges précédents :\n~s\nNouvelle question : ~s",
+                      [ContextLines, Value])).
+
+trim_history(History, Max) ->
+    Len = length(History),
+    case Len > Max of
+        true  -> lists:nthtail(Len - Max, History);
+        false -> History
+    end.
