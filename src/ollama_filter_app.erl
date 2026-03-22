@@ -6,9 +6,14 @@
 %%%
 %%% Maintains a conversation memory (list of {query, answer} pairs)
 %%% so the LLM can reference prior exchanges in its context window.
+%%% Memory is kept in ETS so it survives worker restarts.
 %%%
-%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Memory schema: `#{history => [{QueryBin, AnswerBin}]}' (newest last).
+%%% === Capability cascade ===
+%%%
+%%%   base_capabilities/0 extends em_filter:base_capabilities().
+%%%
+%%% Handler contract: handle/2 (Body, Memory) -> {RawList, NewMemory}.
+%%% Memory schema: #{history => [{QueryBin, AnswerBin}]} (newest last).
 %%% @end
 %%%-------------------------------------------------------------------
 -module(ollama_filter_app).
@@ -16,17 +21,19 @@
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/2]).
-
--define(CAPABILITIES, [
-    <<"ollama">>,
-    <<"llm">>,
-    <<"summarize">>,
-    <<"generate">>,
-    <<"local_ai">>
-]).
+-export([handle/2, base_capabilities/0]).
 
 -define(MAX_HISTORY, 5).
+
+%%====================================================================
+%% Capability cascade
+%%====================================================================
+
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    em_filter:base_capabilities() ++ [<<"ollama">>, <<"llm">>,
+                                      <<"summarize">>, <<"generate">>,
+                                      <<"local_ai">>].
 
 %%====================================================================
 %% Application behaviour
@@ -34,9 +41,10 @@
 
 start(_StartType, _StartArgs) ->
     em_filter:start_agent(ollama_filter, ?MODULE, #{
-        capabilities => ?CAPABILITIES,
+        capabilities => base_capabilities(),
         memory       => ets
-    }).
+    }),
+    {ok, self()}.
 
 stop(_State) ->
     em_filter:stop_agent(ollama_filter).
@@ -75,13 +83,15 @@ handle(_Body, Memory) ->
 
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
-        #{<<"value">> := Val} = Map when is_binary(Val) ->
+        Map when is_map(Map) ->
+            Value   = binary_to_list(maps:get(<<"value">>, Map,
+                          maps:get(<<"query">>, Map, <<"">>))),
             Timeout = case maps:get(<<"timeout">>, Map, undefined) of
                 undefined            -> 10;
                 T when is_integer(T) -> T;
                 T when is_binary(T)  -> binary_to_integer(T)
             end,
-            {binary_to_list(Val), Timeout};
+            {Value, Timeout};
         _ ->
             {binary_to_list(JsonBinary), 10}
     catch
@@ -93,6 +103,7 @@ build_prompt_with_history(Value, [], _Config) ->
         io_lib:format("Résume le texte suivant de façon concise :\n\n~s", [Value]));
 build_prompt_with_history(Value, History, _Config) ->
     ContextLines = [["Q: ", Q, "\nA: ", A, "\n"] || {Q, A} <- History],
+
     unicode:characters_to_binary(
         io_lib:format("Contexte des échanges précédents :\n~s\nNouvelle question : ~s",
                       [ContextLines, Value])).
